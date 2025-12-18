@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from typing import Any
 
@@ -41,6 +42,9 @@ class Condensation(BaseModel):
     action: CondensationAction
 
 
+TokenCounter = Callable[[list[str]], int]
+
+
 class Condenser(ABC):
     """Abstract condenser interface.
 
@@ -51,9 +55,10 @@ class Condenser(ABC):
     If the condenser returns a `Condensation` instead of a `View`, the agent should return `Condensation.action` instead of producing its own action. On the next agent step the condenser will use that condensation event to produce a new `View`.
     """
 
-    def __init__(self):
+    def __init__(self, token_counter: TokenCounter | None = None):
         self._metadata_batch: dict[str, Any] = {}
         self._llm_metadata: dict[str, Any] = {}
+        self._token_counter: TokenCounter | None = token_counter
 
     def add_metadata(self, key: str, value: Any) -> None:
         """Add information to the current metadata batch.
@@ -79,6 +84,25 @@ class Condenser(ABC):
 
         # Since the batch has been written, clear it for the next condensation
         self._metadata_batch = {}
+
+    def _count_tokens(self, text_or_texts: str | Iterable[str]) -> int:
+        """Count tokens for the provided text, using a custom counter if available."""
+
+        texts: list[str]
+        if isinstance(text_or_texts, str):
+            texts = [text_or_texts]
+        else:
+            texts = list(text_or_texts)
+
+        if not texts:
+            return 0
+
+        if self._token_counter is not None:
+            return self._token_counter(texts)
+
+        # Fallback heuristic: assume ~4 characters per token.
+        total_chars = sum(len(text) for text in texts)
+        return max(1, total_chars // 4) if total_chars else 0
 
     @contextmanager
     def metadata_batch(self, state: State):
@@ -181,6 +205,11 @@ class RollingCondenser(Condenser, ABC):
     @abstractmethod
     def get_condensation(self, view: View) -> Condensation:
         """Get the condensation from a view."""
+
+    def _view_token_count(self, view: View) -> int:
+        """Estimate the token footprint for a view's events."""
+
+        return self._count_tokens(str(event) for event in view)
 
     def condense(self, view: View) -> View | Condensation:
         # If we trigger the condenser-specific condensation threshold, compute and return

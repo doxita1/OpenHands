@@ -10,12 +10,22 @@ from openhands.events.action.message import MessageAction, SystemMessageAction
 from openhands.events.event import EventSource
 from openhands.events.observation import Observation
 from openhands.llm.llm_registry import LLMRegistry
-from openhands.memory.condenser.condenser import Condensation, RollingCondenser, View
+from openhands.memory.condenser.condenser import (
+    Condensation,
+    RollingCondenser,
+    TokenCounter,
+    View,
+)
 
 
 class ConversationWindowCondenser(RollingCondenser):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        max_tokens: int | None = None,
+        token_counter: TokenCounter | None = None,
+    ) -> None:
+        self.max_tokens = max_tokens
+        super().__init__(token_counter=token_counter)
 
     def get_condensation(self, view: View) -> Condensation:
         """Apply conversation window truncation similar to _apply_conversation_window.
@@ -174,7 +184,13 @@ class ConversationWindowCondenser(RollingCondenser):
         return Condensation(action=action)
 
     def should_condense(self, view: View) -> bool:
-        return view.unhandled_condensation_request
+        if view.unhandled_condensation_request:
+            return True
+
+        if self.max_tokens is None:
+            return False
+
+        return self._view_token_count(view) > self.max_tokens
 
     @classmethod
     def from_config(
@@ -182,7 +198,27 @@ class ConversationWindowCondenser(RollingCondenser):
         _config: ConversationWindowCondenserConfig,
         llm_registry: LLMRegistry,
     ) -> ConversationWindowCondenser:
-        return ConversationWindowCondenser()
+        token_counter: TokenCounter | None = None
+        if llm_registry is not None:
+            try:
+                llm = llm_registry.get_active_llm()
+
+                def _counter(texts: list[str]) -> int:
+                    from openhands.core.message import Message, TextContent
+
+                    messages = [
+                        Message(role='user', content=[TextContent(text=text)])
+                        for text in texts
+                    ]
+                    return llm.get_token_count(messages)
+
+                token_counter = _counter
+            except Exception:
+                token_counter = None
+
+        return ConversationWindowCondenser(
+            max_tokens=_config.max_tokens, token_counter=token_counter
+        )
 
 
 ConversationWindowCondenser.register_config(ConversationWindowCondenserConfig)

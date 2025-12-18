@@ -6,6 +6,7 @@ from openhands.llm.llm_registry import LLMRegistry
 from openhands.memory.condenser.condenser import (
     Condensation,
     RollingCondenser,
+    TokenCounter,
     View,
 )
 
@@ -13,7 +14,13 @@ from openhands.memory.condenser.condenser import (
 class AmortizedForgettingCondenser(RollingCondenser):
     """A condenser that maintains a condensed history and forgets old events when it grows too large."""
 
-    def __init__(self, max_size: int = 100, keep_first: int = 0):
+    def __init__(
+        self,
+        max_size: int = 100,
+        keep_first: int = 0,
+        max_tokens: int | None = None,
+        token_counter: TokenCounter | None = None,
+    ):
         """Initialize the condenser.
 
         Args:
@@ -34,8 +41,9 @@ class AmortizedForgettingCondenser(RollingCondenser):
 
         self.max_size = max_size
         self.keep_first = keep_first
+        self.max_tokens = max_tokens
 
-        super().__init__()
+        super().__init__(token_counter=token_counter)
 
     def get_condensation(self, view: View) -> Condensation:
         target_size = self.max_size // 2
@@ -55,7 +63,16 @@ class AmortizedForgettingCondenser(RollingCondenser):
         return Condensation(action=event)
 
     def should_condense(self, view: View) -> bool:
-        return len(view) > self.max_size or view.unhandled_condensation_request
+        if view.unhandled_condensation_request:
+            return True
+
+        if len(view) > self.max_size:
+            return True
+
+        if self.max_tokens is None:
+            return False
+
+        return self._view_token_count(view) > self.max_tokens
 
     @classmethod
     def from_config(
@@ -63,7 +80,28 @@ class AmortizedForgettingCondenser(RollingCondenser):
         config: AmortizedForgettingCondenserConfig,
         llm_registry: LLMRegistry,
     ) -> AmortizedForgettingCondenser:
-        return AmortizedForgettingCondenser(**config.model_dump(exclude={'type'}))
+        token_counter: TokenCounter | None = None
+        if llm_registry is not None:
+            try:
+                llm = llm_registry.get_active_llm()
+
+                def _counter(texts: list[str]) -> int:
+                    from openhands.core.message import Message, TextContent
+
+                    messages = [
+                        Message(role='user', content=[TextContent(text=text)])
+                        for text in texts
+                    ]
+                    return llm.get_token_count(messages)
+
+                token_counter = _counter
+            except Exception:
+                token_counter = None
+
+        return AmortizedForgettingCondenser(
+            **config.model_dump(exclude={'type'}),
+            token_counter=token_counter,
+        )
 
 
 AmortizedForgettingCondenser.register_config(AmortizedForgettingCondenserConfig)

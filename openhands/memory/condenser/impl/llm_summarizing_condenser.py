@@ -10,6 +10,7 @@ from openhands.llm.llm_registry import LLMRegistry
 from openhands.memory.condenser.condenser import (
     Condensation,
     RollingCondenser,
+    TokenCounter,
     View,
 )
 
@@ -28,6 +29,9 @@ class LLMSummarizingCondenser(RollingCondenser):
         max_size: int = 100,
         keep_first: int = 1,
         max_event_length: int = 10_000,
+        max_tokens: int | None = None,
+        max_event_tokens: int | None = None,
+        token_counter: TokenCounter | None = None,
     ):
         if keep_first >= max_size // 2:
             raise ValueError(
@@ -41,32 +45,103 @@ class LLMSummarizingCondenser(RollingCondenser):
         self.max_size = max_size
         self.keep_first = keep_first
         self.max_event_length = max_event_length
+        self.max_tokens = max_tokens
+        self.max_event_tokens = max_event_tokens
         self.llm = llm
 
-        super().__init__()
+        if token_counter is None:
+
+            def _counter(texts: list[str]) -> int:
+                messages = [
+                    Message(role='user', content=[TextContent(text=text)])
+                    for text in texts
+                ]
+                return self.llm.get_token_count(messages)
+
+            token_counter = _counter
+
+        super().__init__(token_counter=token_counter)
 
     def _truncate(self, content: str) -> str:
-        """Truncate the content to fit within the specified maximum event length."""
-        return truncate_content(content, max_chars=self.max_event_length)
+        """Truncate the content to fit within the specified maximum token budget."""
+
+        if not content:
+            return content
+
+        if self.max_event_tokens is None:
+            return truncate_content(content, max_chars=self.max_event_length)
+
+        truncated = content
+        max_chars = len(content)
+        attempts = 0
+        while self._count_tokens(truncated) > self.max_event_tokens and max_chars > 0:
+            max_chars = max(1, int(max_chars * 0.8))
+            truncated = truncate_content(content, max_chars=max_chars)
+            attempts += 1
+            if attempts > 10:
+                break
+
+        return truncated
+
+    def _event_text(self, event: AgentCondensationObservation | object) -> str:
+        return self._truncate(str(event))
+
+    def _event_token_count(self, event: object) -> int:
+        return self._count_tokens(self._event_text(event))
+
+    def _view_token_count(self, view: View) -> int:
+        return self._count_tokens(self._event_text(event) for event in view)
 
     def get_condensation(self, view: View) -> Condensation:
         head = view[: self.keep_first]
         target_size = self.max_size // 2
-        # Number of events to keep from the tail -- target size, minus however many
-        # prefix events from the head, minus one for the summarization event
-        events_from_tail = target_size - len(head) - 1
+        target_tokens = self.max_tokens // 2 if self.max_tokens else None
 
         summary_event = (
             view[self.keep_first]
             if isinstance(view[self.keep_first], AgentCondensationObservation)
             else AgentCondensationObservation('No events summarized')
         )
+        summary_text = self._truncate(
+            summary_event.message if summary_event.message else ''
+        )
+        summary_tokens = self._count_tokens(summary_text)
 
-        # Identify events to be forgotten (those not in head or tail)
-        forgotten_events = []
-        for event in view[self.keep_first : -events_from_tail]:
-            if not isinstance(event, AgentCondensationObservation):
-                forgotten_events.append(event)
+        head_tokens = self._count_tokens(self._event_text(event) for event in head)
+
+        if target_tokens is None:
+            events_from_tail = max(0, target_size - len(head) - 1)
+            tail = view[-events_from_tail:] if events_from_tail > 0 else []
+        else:
+            available_tokens = max(0, target_tokens - head_tokens - summary_tokens)
+            events = view.events
+            tail: list[object] = []
+            for event in reversed(events):
+                if event in head or isinstance(event, AgentCondensationObservation):
+                    continue
+                event_tokens = self._event_token_count(event)
+                if event_tokens <= available_tokens:
+                    tail.append(event)
+                    available_tokens -= event_tokens
+                else:
+                    break
+            tail.reverse()
+
+        tail_ids = {event.id for event in tail}
+        head_ids = {event.id for event in head}
+        summary_id = getattr(summary_event, 'id', None)
+
+        forgotten_events = [
+            event
+            for event in view
+            if not isinstance(event, AgentCondensationObservation)
+            and event.id not in tail_ids
+            and event.id not in head_ids
+            and (summary_id is None or event.id != summary_id)
+        ]
+
+        if not forgotten_events:
+            return Condensation(action=CondensationAction(forgotten_event_ids=[]))
 
         # Construct prompt for summarization
         prompt = """You are maintaining a context-aware state summary for an interactive agent.
@@ -119,20 +194,14 @@ CURRENT_STATE: Last flip: Heads, Haiku count: 15/20"""
 
         prompt += '\n\n'
 
-        # Add the previous summary if it exists. We'll always have a summary
-        # event, but the types aren't precise enought to guarantee that it has a
-        # message attribute.
-        summary_event_content = self._truncate(
-            summary_event.message if summary_event.message else ''
-        )
-        prompt += f'<PREVIOUS SUMMARY>\n{summary_event_content}\n</PREVIOUS SUMMARY>\n'
+        prompt += f'<PREVIOUS SUMMARY>\n{summary_text}\n</PREVIOUS SUMMARY>\n'
 
         prompt += '\n\n'
 
         # Add all events that are being forgotten. We use the string
         # representation defined by the event, and truncate it if necessary.
         for forgotten_event in forgotten_events:
-            event_content = self._truncate(str(forgotten_event))
+            event_content = self._event_text(forgotten_event)
             prompt += f'<EVENT id={forgotten_event.id}>\n{event_content}\n</EVENT>\n'
 
         prompt += 'Now summarize the events using the rules above.'
@@ -158,7 +227,16 @@ CURRENT_STATE: Last flip: Heads, Haiku count: 15/20"""
         )
 
     def should_condense(self, view: View) -> bool:
-        return len(view) > self.max_size or view.unhandled_condensation_request
+        if view.unhandled_condensation_request:
+            return True
+
+        if len(view) > self.max_size:
+            return True
+
+        if self.max_tokens is None:
+            return False
+
+        return self._view_token_count(view) > self.max_tokens
 
     @classmethod
     def from_config(
@@ -176,6 +254,8 @@ CURRENT_STATE: Last flip: Heads, Haiku count: 15/20"""
             max_size=config.max_size,
             keep_first=config.keep_first,
             max_event_length=config.max_event_length,
+            max_tokens=config.max_tokens,
+            max_event_tokens=config.max_event_tokens,
         )
 
 

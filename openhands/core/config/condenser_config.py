@@ -77,9 +77,19 @@ class LLMSummarizingCondenserConfig(BaseModel):
         description='Maximum size of the condensed history before triggering forgetting.',
         ge=2,
     )
+    max_tokens: int | None = Field(
+        default=None,
+        description='Optional maximum token budget before triggering forgetting.',
+        ge=1,
+    )
     max_event_length: int = Field(
         default=10_000,
         description='Maximum length of the event representations to be passed to the LLM.',
+    )
+    max_event_tokens: int | None = Field(
+        default=None,
+        description='Optional maximum token budget for a single event representation.',
+        ge=1,
     )
 
     model_config = ConfigDict(extra='forbid')
@@ -93,6 +103,11 @@ class AmortizedForgettingCondenserConfig(BaseModel):
         default=100,
         description='Maximum size of the condensed history before triggering forgetting.',
         ge=2,
+    )
+    max_tokens: int | None = Field(
+        default=None,
+        description='Optional maximum token budget before triggering forgetting.',
+        ge=1,
     )
 
     # at least one event by default, because the best guess is that it's the user task
@@ -174,6 +189,11 @@ class ConversationWindowCondenserConfig(BaseModel):
     """
 
     type: Literal['conversation_window'] = Field(default='conversation_window')
+    max_tokens: int | None = Field(
+        default=None,
+        description='Optional maximum token budget before triggering forgetting.',
+        ge=1,
+    )
 
     model_config = ConfigDict(extra='forbid')
 
